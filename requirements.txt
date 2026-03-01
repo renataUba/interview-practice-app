@@ -1,2 +1,8 @@
 streamlit
 pandas
+dotenv
+google-genai
+python-dotenv
+requests
+beautifulsoup4
+json

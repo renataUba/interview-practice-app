@@ -1,151 +1,292 @@
+import os 
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
+from pydantic import BaseModel
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+st.title("Interview Practice with Gemini")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# ── Response Schema ────────────────────────────────────────────────────────────
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+class TechnicalSkill(BaseModel):
+    skill: str
+    example_interview_question: str
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+class JobAnalysis(BaseModel):
+    job_title: str
+    location: str
+    work_mode: str
+    language_requirements: list[str]
+    years_of_experience: int
+    technical_skills: list[TechnicalSkill]  # exactly 5
+    soft_skills: list[str]                  # exactly 2
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# ── Gemini Setup ───────────────────────────────────────────────────────────────
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+load_dotenv("geminai.env")
+api_key = os.getenv("Default_Gemini_API_Key_Free")
+if not api_key:
+    raise ValueError("Please set your API key in geminai.env or environment")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+client = genai.Client(api_key=api_key)
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+# ── Session State ──────────────────────────────────────────────────────────────
 
-    return gdp_df
+if "result" not in st.session_state:
+    st.session_state.result = None
+if "technical_skills" not in st.session_state:
+    st.session_state.technical_skills = []
+if "clicked_skill" not in st.session_state:
+    st.session_state.clicked_skill = None
+if "skill_resource" not in st.session_state:
+    st.session_state.skill_resource = {}
 
-gdp_df = get_gdp_data()
+# ── URL Input ──────────────────────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+url = st.text_input("Enter your Job ad URL:")
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+if st.button("Consult Gemini"):
+    if not url:
+        st.warning("Please provide job ad URL.")
+    else:
+        try:
+            # Fetch and clean HTML
+            response = requests.get(url, timeout=10)
+            soup = BeautifulSoup(response.text, "html.parser")
+            for tag in soup(["script", "style"]):
+                tag.extract()
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+            page_text = soup.get_text(separator=" ", strip=True)
+            MAX_CHARS = 15000
+            if len(page_text) > MAX_CHARS:
+                page_text = page_text[:MAX_CHARS]
+                st.caption("Page content was trimmed to fit analysis limits.")
 
-# Add some spacing
-''
-''
+            # Prompt
+            SYSTEM_INSTRUCTION = """
+            You are an expert recruiter specialised in IT roles.
+            You only answer questions related to interview preparation.
+            Refuse: illegal content, hacking, medical/legal advice, explicit content.
+            """.strip()
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+            OUTPUT_INSTRUCTIONS = """
+            Analyse the job ad and return structured JSON with:
+            1. Job title, location, work mode (remote/on-site/hybrid), language requirements, years of experience.
+            2. Exactly 5 technical skills ranked by importance, each with one realistic interview question.
+            3. Exactly 2 soft skills most critical for the role.
+            Return ONLY valid JSON. No markdown, no explanation.
+            Output should be in English language.
+            """.strip()
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+            prompt = f"{OUTPUT_INSTRUCTIONS}\n\n--- JOB AD ---\n{page_text}\n--- END ---"
 
-countries = gdp_df['Country Code'].unique()
+            # Gemini call
+            gemini_response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.3,
+                    top_p=0.9,
+                    top_k=40,
+                    response_mime_type="application/json",
+                    response_schema=JobAnalysis,
+                ),
+            )
 
-if not len(countries):
-    st.warning("Select at least one country")
+            # Parse and store in session state
+            result = JobAnalysis.model_validate_json(gemini_response.text)
+            st.session_state.result = result
+            st.session_state.technical_skills = [ts.skill for ts in result.technical_skills]
+            st.session_state.clicked_skill = None   # reset on new search
+            st.session_state.skill_resource = {}    # reset on new search
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Failed to fetch the page (HTTP error): {e}")
+        except requests.exceptions.ConnectionError:
+            st.error("Could not connect to the URL. Check the address and try again.")
+        except requests.exceptions.InvalidURL:
+            st.error("The URL appears to be invalid. Make sure it starts with https://")
+        except Exception as e:
+            st.error(f"Unexpected error: {e}")
 
-''
-''
-''
+# ── Display Job Analysis ───────────────────────────────────────────────────────
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+if st.session_state.result:
+    result = st.session_state.result
 
-st.header('GDP over time', divider='gray')
+    st.subheader("Job Overview")
+    st.write(f"**Role:** {result.job_title} — {result.location} ({result.work_mode})")
+    st.write(f"**Experience:** {result.years_of_experience} years")
+    st.write(f"**Languages:** {', '.join(result.language_requirements)}")
 
-''
+    st.subheader("Click on a technical skill to see a practice question")
+    for i, ts in enumerate(result.technical_skills, 1):
+        with st.expander(f"{i}. {ts.skill}"):
+            st.write(f"**Interview Q:** {ts.example_interview_question}")
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
+    st.subheader("Soft Skills")
+    for ss in result.soft_skills:
+        st.write(f"• {ss}")
 
-''
-''
+# ── Clickable Skill Buttons ────────────────────────────────────────────────────
 
+if st.session_state.technical_skills:
+    st.subheader("Click on a skill to find a learning resource:")
+    for skill in st.session_state.technical_skills:
+        if st.button(skill):
+            st.session_state.clicked_skill = skill
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+# ── Fetch Gemini Learning Resource ────────────────────────────────────────────
 
-st.header(f'GDP in {to_year}', divider='gray')
+if st.session_state.clicked_skill:
+    skill = st.session_state.clicked_skill
 
-''
+    if skill not in st.session_state.skill_resource:
+        resource_prompt = f"""
+        ZERO-SHOT + role Prompt:
+        You are a senior technical mentor.
+        Provide one link to a documentation, tutorial, or course where someone can learn: {skill}.
+        Only use well-known, stable domains (official docs, major learning platforms, universities).
+        If uncertain about a URL, provide the platform homepage and exact course name instead.
+        Prefer: Coursera, edX, Udemy, freeCodeCamp, MIT OpenCourseWare, Stanford Online, Harvard Online.
+        Return ONLY valid JSON:
+        {{
+            "skill": "{skill}",
+            "resource": "URL to learn this skill"
+        }}
+        """.strip()
 
-cols = st.columns(4)
+        try:
+            gemini_resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=resource_prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.3,
+                    top_p=0.9,
+                    top_k=40,
+                    response_mime_type="application/json",
+                ),
+            )
+            import json
+            data = json.loads(gemini_resp.text)
+            st.session_state.skill_resource[skill] = data.get("resource", None)
+        except Exception as e:
+            st.error(f"Error fetching resource: {e}")
+            st.session_state.skill_resource[skill] = None
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+# ── Display Learning Resource ──────────────────────────────────────────────────
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+if st.session_state.clicked_skill:
+    skill = st.session_state.clicked_skill
+    resource = st.session_state.skill_resource.get(skill)
+    if resource:
+        st.markdown(
+            f'<a href="{resource}" target="_blank" rel="noopener noreferrer">'
+            f'Learn {skill}</a>',
+            unsafe_allow_html=True,
         )
+
+
+# different prompting techniques:
+
+        #  #FEW-SHOT Prompt:
+        # You are a senior technical mentor.
+        # Provide one link to a documentation, tutorial, or course where someone can learn: {skill}.
+        # Only use well-known, stable domains (official docs, major learning platforms, universities).
+        # If uncertain about a URL, provide the platform homepage and exact course name instead.
+        # Prefer: Coursera, edX, Udemy, freeCodeCamp, MIT OpenCourseWare, Stanford Online, Harvard Online.
+
+        # Here are examples of the expected output format:
+
+        # Example 1:
+        # Skill: Machine Learning
+        # Output: {{"skill": "Machine Learning", "resource": "https://www.coursera.org/learn/machine-learning"}}
+
+        # Example 2:
+        # Skill: Web Development
+        # Output: {{"skill": "Web Development", "resource": "https://www.freecodecamp.org/learn/responsive-web-design/"}}
+
+        # Example 3:
+        # Skill: Data Structures and Algorithms
+        # Output: {{"skill": "Data Structures and Algorithms", "resource": "https://ocw.mit.edu/courses/6-006-introduction-to-algorithms-spring-2020/"}}
+
+        # Now, return ONLY valid JSON for the following skill:
+        # {{
+        #     "skill": "{skill}",
+        #     "resource": "URL to learn this skill"
+        # }}
+
+        #chain of thought
+        # You are a senior technical mentor.
+        # Provide one link to a documentation, tutorial, or course where someone can learn: {skill}.
+        # Only use well-known, stable domains (official docs, major learning platforms, universities).
+        # If uncertain about a URL, provide the platform homepage and exact course name instead.
+        # Prefer: Coursera, edX, Udemy, freeCodeCamp, MIT OpenCourseWare, Stanford Online, Harvard Online.
+
+        # Before providing your answer, think through the following steps:
+
+        # Step 1 - Classify the skill type:
+        # Ask yourself: Is this a programming language, a framework, a concept, a tool, or a soft skill?
+        # This determines whether official docs or a structured course is more appropriate.
+
+        # Step 2 - Identify the best resource type:
+        # - Programming languages → Official documentation (e.g., docs.python.org)
+        # - Frameworks/Libraries → Official docs or freeCodeCamp
+        # - Academic concepts (ML, AI, Algorithms) → MIT OCW, Stanford Online, Coursera
+        # - General tech skills → Coursera, edX, freeCodeCamp, Udemy
+
+        # Step 3 - Select a specific resource:
+        # Name the platform you've chosen and why it's the best fit for this skill.
+
+        # Step 4 - Verify URL confidence:
+        # Ask yourself: Am I confident this exact URL exists and is stable?
+        # - If YES → use the full URL
+        # - If NO → use the platform homepage + exact course/page name
+
+        # Step 5 - Format the output:
+        # Return ONLY valid JSON with no explanation outside it:
+        # {{
+        #     "skill": "{skill}",
+        #     "resource": "URL to learn this skill"
+        # }}
+
+        # Example of this reasoning process:
+        # Skill: Docker
+        # Step 1: Docker is a tool/platform.
+        # Step 2: Tools are best learned via official docs or structured tutorials.
+        # Step 3: docs.docker.com is the official, stable, well-maintained documentation.
+        # Step 4: I am confident https://docs.docker.com/get-started/ is a valid, stable URL.
+        # Step 5: {{"skill": "Docker", "resource": "https://docs.docker.com/get-started/"}}
+
+        # Now apply this reasoning to: {skill}
+        # Return ONLY the final JSON output.
+
+        #Self-Consistency:
+        # You are a senior technical mentor. Provide one resource link to learn: {skill}.
+        # Only use well-known, stable domains. Prefer: Coursera, edX, freeCodeCamp, MIT OCW, Stanford Online, official docs.
+
+        # Generate 3 independent reasoning paths, then pick the most consistent answer:
+
+        # Path 1 - Official source angle:
+        # What is the most authoritative/official resource for {skill}?
+
+        # Path 2 - Learner angle:
+        # What resource would best suit a complete beginner learning {skill} from scratch?
+
+        # Path 3 - Popularity angle:
+        # What is the most widely recommended resource for {skill} across the developer community?
+
+        # Final decision:
+        # Compare the 3 paths. If 2 or more agree on the same resource → use it.
+        # If all 3 differ → default to the most authoritative source (Path 1).
+        # If uncertain about any URL → use platform homepage + exact course name.
+
+        # Return ONLY valid JSON:
+        # {{
+        #     "skill": "{skill}",
+        #     "resource": "URL to learn this skill"
+        # }}
